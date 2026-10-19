@@ -1,0 +1,66 @@
+---
+# =====================================================================
+# Lab 3: PHP paigaldamine kliendiserverisse Ansible playbook'iga
+# Fail:   /root/playbooks/php7.yml
+# Autor:  Romet Mottus
+#
+# Kontroll (muudatusi ei tehta):  ansible-playbook --check /root/playbooks/php7.yml
+# Kaivitamine:                    ansible-playbook /root/playbooks/php7.yml
+#
+# Markus: Debian 13 hoidlas puudub php7.x, seega paigaldame uldise paketi
+# "php". state=latest toob uldjuhul VIIMASE versiooni (Debian 13 puhul PHP 8.4).
+# =====================================================================
+
+- name: PHP paigaldamine ja kontrollfaili loomine
+  hosts: klient1        # kliendiserver (Debian 13), kuhu Apache2 on juba paigaldatud
+  tasks:
+
+    # 1. PHP paigaldamine (moodul apt)
+    - name: installeerime php
+      apt:
+        name: php
+        state: latest
+        update_cache: yes
+
+    # 2. Apache2 PHP moodul, et veebiserver oskaks .php faile tolgendada
+    - name: installeerime libapache2-mod-php
+      apt:
+        name: libapache2-mod-php
+        state: latest
+
+    # 3. PHP laiendus MySQL/MariaDB uhendusteks (tuleb vaja jargmistes labrites)
+    - name: installeerime php-mysql
+      apt:
+        name: php-mysql
+        state: latest
+
+    # 4. Iseseisev ulesanne 1: loome phpinfo.php (ja info.php) kataloogi /var/www/html/
+    - name: loome PHP kontrollfailid kataloogi /var/www/html/
+      copy:
+        dest: "/var/www/html/{{ item }}"
+        content: "<?php phpinfo(); ?>\n"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - phpinfo.php
+        - info.php
+
+    # 5. Taaskaivitame Apache2, et PHP moodul rakenduks
+    - name: Apache2 taaskaivitamine
+      service:
+        name: apache2
+        state: restarted
+        enabled: yes
+
+    # 6. Kontrollime paigaldatud PHP versiooni ja kuvame selle
+    - name: kontrollime PHP versiooni
+      command: php -v
+      register: php_versioon
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: PHP versioon
+      debug:
+        var: php_versioon.stdout_lines

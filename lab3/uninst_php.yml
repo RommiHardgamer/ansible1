@@ -1,0 +1,58 @@
+---
+# =====================================================================
+# Lab 3, iseseisev ulesanne 2: PHP eemaldamine kliendiserverist
+# Fail:   /root/playbooks/uninst_php.yml
+# Autor:  Romet Mottus
+#
+# Kasitsi eemaldamise kaskudest (PHP 7 naide) lahtuv loogika:
+#   apt-get purge php7.*
+#   apt-get purge php7.X-common
+#   apt remove php7.X*
+# Debian 13 hoidlas on PHP 8.4, seega eemaldame samal viisil koik php* paketid
+# (php8.4, php8.4-cli, php8.4-common jne) ja Apache2 PHP mooduli.
+#
+# Kontroll:     ansible-playbook --check /root/playbooks/uninst_php.yml
+# Kaivitamine:  ansible-playbook /root/playbooks/uninst_php.yml
+# Taastamine:   ansible-playbook /root/playbooks/php7.yml
+# =====================================================================
+
+- name: PHP eemaldamine kliendiserverist
+  hosts: klient1        # kliendiserver (Debian 13)
+  tasks:
+
+    # 1. Kustutame phpinfo kontrollfailid (ilma PHP-ta naidataks neid lihttekstina)
+    - name: kustutame PHP kontrollfailid
+      file:
+        path: "/var/www/html/{{ item }}"
+        state: absent
+      loop:
+        - phpinfo.php
+        - info.php
+
+    # 2. Eemaldame php paketid koos seadistustega (purge = apt-get purge)
+    - name: eemaldame php ja Apache2 PHP moodul (purge)
+      apt:
+        name:
+          - "php*"
+          - "libapache2-mod-php*"
+        state: absent
+        purge: yes
+        autoremove: yes
+
+    # 3. Taaskaivitame Apache2, et veebiserver jataks PHP mooduli kasutamata
+    - name: Apache2 taaskaivitamine
+      service:
+        name: apache2
+        state: restarted
+
+    # 4. Kontrollime, et php kask enam ei tootaks (2 = kasku ei leitud)
+    - name: kontrollime, kas php on eemaldatud
+      command: php -v
+      register: php_kontroll
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: php kontrolli tulemus
+      debug:
+        msg: "php -v valjundkood {{ php_kontroll.rc }} (2 = php puudub, eemaldamine onnestus)"
