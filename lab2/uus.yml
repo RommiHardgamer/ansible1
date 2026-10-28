@@ -1,0 +1,13 @@
+# lab 2 iseseisev: unikaalne index.html igale kliendile
+---
+- name: unikaalne avaleht igale kliendile
+  hosts: webservers
+  tasks:
+    # 1. veendume et kaust on olemas
+    - name: loome www kausta
+      file: path=/var/www/html state=directory mode=0755
+    # 2. kirjutame unikaalse lehe
+    - name: uus index.html
+      copy:
+        dest: /var/www/html/index.html
+        content: 'tere, olen {{ ansible_hostname }} ip {{ ansible_default_ipv4.address }}'

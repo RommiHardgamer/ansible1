@@ -1,0 +1,254 @@
+---
+# Sammu 12 lahendus: backupexec - automaatne varundus kontrollidega (backupexec.sh Ansible'i versioon)
+#
+# Teeb kõik eelmised sammud ühe käiguga:
+#   - kontrollib lähtekausta ja vaba ruumi (samm 8)
+#   - teeb arhiivid ajutisse kausta (mktemp -d ehk tempfile) kolme kompressoriga (samm 10)
+#   - välistab failid (samm 5) ja kasutab src/.backupignore faili (samm 11)
+#   - valib parima (väikseima) kompressori
+#   - kontrollib, et arhiiv avaneb ja sisaldab alamkausta src/docs/ (samm 2)
+#   - jätab arhiivi salvestamata, kui sama sisuga arhiiv on varukaustas juba olemas
+#   - arvutab ja kontrollib SHA-256 kontrollsumma (samm 9)
+#   - hoiab ainult viimaseid koopiaid (samm 4)
+#   - logib algust, lõppu ja vigu faili backup.log (samm 7)
+#   - kustutab ajutised failid alati (trap ... EXIT ehk always)
+#
+# Käivitamine:  ansible-playbook backupexec.yml
+# Muutujad:     -e hoia=3   -e praks2=/root/praks2
+
+- name: backupexec - automaatne varundus kontrollidega
+  hosts: webservers
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: auto_silent
+    praks2: /root/praks2
+    src_kaust: "{{ praks2 }}/src"
+    backup_kaust: "{{ praks2 }}/backup"
+    logifail: "{{ praks2 }}/logs/backup.log"
+    hoia: 3
+    valistused: ['*.jpg', 'bin']
+    pakid: "{{ ['tar', 'zstd', 'xz-utils', 'gzip'] if ansible_facts['os_family'] == 'Debian' else ['tar', 'zstd', 'xz', 'gzip'] }}"
+    pakkijad:
+      - {laiend: tar.zst, opts: [tar, -I, "zstd -19 -T0"]}
+      - {laiend: tar.gz, opts: [tar, -z]}
+      - {laiend: tar.xz, opts: [tar, -J]}
+  tasks:
+    - name: Paigalda vajalikud paketid
+      ansible.builtin.package:
+        name: "{{ pakid }}"
+        state: present
+      when: paketid_paigalda | default(true) | bool
+
+    - name: Loo varukaust ja logikaust
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ backup_kaust }}"
+        - "{{ logifail | dirname }}"
+
+    - name: Loo ajutine kaust (mktemp -d)
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: backupexec.
+      register: tmp
+
+    - name: Varundus
+      block:
+        - name: Kontrolli, et lähtekaust on olemas
+          ansible.builtin.stat:
+            path: "{{ src_kaust }}"
+          register: lahtekaust
+
+        - name: Katkesta, kui lähtekausta pole
+          ansible.builtin.assert:
+            that: lahtekaust.stat.isdir | default(false)
+            fail_msg: "Lähtekausta {{ src_kaust }} ei ole olemas"
+            success_msg: "Lähtekaust {{ src_kaust }} on olemas"
+
+        - name: Logi - BACKUP START
+          ansible.builtin.lineinfile:
+            path: "{{ logifail }}"
+            line: "[ {{ '%F %T' | strftime }} ] BACKUP START"
+            create: true
+            insertafter: EOF
+
+        - name: Lähtekausta suurus baitides (du -sb)
+          ansible.builtin.command: "du -sb {{ src_kaust }}"
+          register: du
+          changed_when: false
+
+        - name: Vaba ruum varukaustas baitides (df -B1)
+          ansible.builtin.command: "df -B1 --output=avail {{ backup_kaust }}"
+          register: df
+          changed_when: false
+
+        - name: Vaba ruumi kontroll - kui ruumi on liiga vähe, varundus ei käivitu
+          ansible.builtin.assert:
+            that: df.stdout_lines[1] | int > du.stdout.split()[0] | int
+            fail_msg: "Ruumi on liiga vähe, varundus ei käivitu"
+            success_msg: "Ruumi on piisavalt: vaba {{ df.stdout_lines[1] | int }} B, vaja {{ du.stdout.split()[0] | int }} B"
+
+        - name: Kas on olemas .backupignore
+          ansible.builtin.stat:
+            path: "{{ src_kaust }}/.backupignore"
+          register: ignore_stat
+
+        - name: Loe .backupignore
+          ansible.builtin.slurp:
+            src: "{{ src_kaust }}/.backupignore"
+          register: ignore_sisu
+          when: ignore_stat.stat.exists
+
+        - name: Koosta tar-i välistuste fail (valistused + .backupignore)
+          ansible.builtin.copy:
+            dest: "{{ tmp.path }}/valistused"
+            content: "{{ (valistused + ((ignore_sisu.content | b64decode).splitlines() | map('regex_replace', '/$', '') | list if ignore_stat.stat.exists else [])) | join('\n') }}\n"
+            mode: "0600"
+
+        - name: Ajatempel arhiivi nimele
+          ansible.builtin.set_fact:
+            ts: "{{ '%Y%m%d-%H%M%S' | strftime }}"
+
+        - name: Tee arhiivid ajutisse kausta kõigi kolme kompressoriga
+          ansible.builtin.command:
+            argv: "{{ item.opts + ['--exclude-from=' ~ tmp.path ~ '/valistused', '-cf', tmp.path ~ '/src_' ~ ts ~ '.' ~ item.laiend, '-C', praks2, 'src'] }}"
+          loop: "{{ pakkijad }}"
+          loop_control:
+            label: "{{ item.laiend }}"
+          changed_when: false
+
+        - name: Leia ajutised arhiivid
+          ansible.builtin.find:
+            paths: "{{ tmp.path }}"
+            patterns: "src_*.tar.*"
+          register: kandidaadid
+
+        - name: Vali parim kompressor (väikseim arhiiv)
+          ansible.builtin.set_fact:
+            valitud: "{{ kandidaadid.files | sort(attribute='size') | first }}"
+
+        - name: Kontrolli, et arhiiv avaneb (tar -tf)
+          ansible.builtin.command:
+            argv: [tar, -tf, "{{ valitud.path }}"]
+          register: sisu
+          changed_when: false
+
+        - name: Kontrolli, et arhiiv sisaldab alamkausta src/docs/
+          ansible.builtin.assert:
+            that: "'src/docs/' in sisu.stdout_lines"
+            fail_msg: "Arhiiv ei sisalda alamkausta src/docs/"
+            success_msg: "Arhiiv avaneb ja sisaldab alamkausta src/docs/"
+
+        - name: Arvuta uue arhiivi SHA-256
+          ansible.builtin.stat:
+            path: "{{ valitud.path }}"
+            checksum_algorithm: sha256
+          register: uus_stat
+
+        - name: Leia varukaustas juba olemasolevad arhiivid
+          ansible.builtin.find:
+            paths: "{{ backup_kaust }}"
+            patterns: '^src_.*[.]tar[.](zst|gz|xz)$'
+            use_regex: true
+          register: olemas
+
+        - name: Arvuta olemasolevate arhiivide SHA-256
+          ansible.builtin.stat:
+            path: "{{ item.path }}"
+            checksum_algorithm: sha256
+          loop: "{{ olemas.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          register: olemas_stat
+
+        - name: Kas sama sisuga arhiiv on juba olemas
+          ansible.builtin.set_fact:
+            duplikaat: "{{ uus_stat.stat.checksum in (olemas_stat.results | map(attribute='stat.checksum') | list) }}"
+
+        - name: Teade - arhiiv on juba olemas
+          ansible.builtin.debug:
+            msg: "Sama sisuga arhiiv on varukaustas juba olemas, uut ei salvestata"
+          when: duplikaat
+
+        - name: Salvesta arhiiv varukausta
+          ansible.builtin.copy:
+            src: "{{ valitud.path }}"
+            dest: "{{ backup_kaust }}/{{ valitud.path | basename }}"
+            remote_src: true
+            mode: "0644"
+          when: not duplikaat
+
+        - name: Arvuta kontrollsumma - sha256sum
+          ansible.builtin.command:
+            argv: [sha256sum, "{{ valitud.path | basename }}"]
+            chdir: "{{ backup_kaust }}"
+          register: summa
+          changed_when: false
+          when: not duplikaat
+
+        - name: Salvesta kontrollsumma faili (.sha256)
+          ansible.builtin.copy:
+            content: "{{ summa.stdout }}\n"
+            dest: "{{ backup_kaust }}/{{ valitud.path | basename }}.sha256"
+            mode: "0644"
+          when: not duplikaat
+
+        - name: Kontrolli kontrollsummat - sha256sum -c
+          ansible.builtin.command:
+            argv: [sha256sum, -c, "{{ valitud.path | basename }}.sha256"]
+            chdir: "{{ backup_kaust }}"
+          register: kontroll
+          changed_when: false
+          failed_when: "': OK' not in kontroll.stdout"
+          when: not duplikaat
+
+        - name: Leia kõik varukoopiad
+          ansible.builtin.find:
+            paths: "{{ backup_kaust }}"
+            patterns: '^src_.*[.]tar[.](zst|gz|xz)$'
+            use_regex: true
+          register: koik
+
+        - name: Kustuta vanemad koopiad, hoia ainult {{ hoia }} uusimat
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ (koik.files | sort(attribute='mtime', reverse=true))[hoia:] | map(attribute='path') | product(['', '.sha256']) | map('join') | list }}"
+
+        - name: Logi - BACKUP END
+          ansible.builtin.lineinfile:
+            path: "{{ logifail }}"
+            line: "[ {{ '%F %T' | strftime }} ] BACKUP END {{ valitud.path | basename }} ({{ valitud.size }} B){{ ' - sama sisu on juba varukaustas, uut ei salvestatud' if duplikaat else '' }}"
+            insertafter: EOF
+
+        - name: Tulemus
+          ansible.builtin.debug:
+            msg:
+              - "Varundus õnnestus"
+              - "Valitud kompressor ja arhiiv: {{ valitud.path | basename }} ({{ valitud.size }} B)"
+              - "Kontrollsumma: {{ kontroll.stdout | default('arhiiv oli juba olemas') }}"
+              - "Logi: {{ logifail }}"
+
+      rescue:
+        - name: Logi - BACKUP FAILED
+          ansible.builtin.lineinfile:
+            path: "{{ logifail }}"
+            line: "[ {{ '%F %T' | strftime }} ] BACKUP FAILED: {{ ansible_failed_result.msg | default('tundmatu viga') }}"
+            create: true
+            insertafter: EOF
+
+        - name: Teata viga
+          ansible.builtin.debug:
+            msg: "Varundus ebaõnnestus: {{ ansible_failed_result.msg | default('tundmatu viga') }}"
+
+        - name: Märgi töö ebaõnnestunuks
+          ansible.builtin.fail:
+            msg: "Varundus ebaõnnestus, vaata logi {{ logifail }}"
+
+      always:
+        - name: Kustuta ajutised failid (trap ... EXIT)
+          ansible.builtin.file:
+            path: "{{ tmp.path }}"
+            state: absent

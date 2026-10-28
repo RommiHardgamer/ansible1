@@ -1,0 +1,265 @@
+---
+# BASH haldus - praks1 (kasutajate haldus), lahendus Ansible'iga
+#
+# Kõik 6 ülesannet on selles ühes failis, igal ülesandel on oma tag:
+#   ul1 .. ul6   ehk näiteks:  ansible-playbook praks1.yml --tags ul1 -e kasutajanimi=romet
+#   ilma tagita käivituvad kõik ülesanded (ul1 näitab kasutusjuhendit, kui kasutajanime ei anta)
+#   --tags kustuta  eemaldab katsetamisel loodud kasutajad (romet1..3 ning käsurealt antud kasutajanimi)
+#
+# Andmefailid asuvad playbooki kõrval:
+#   kasutajad            - iga rida on kasutajanimi
+#   kasutajad-paroolid   - iga rida on kasutajanimi:parool
+#   paroolid             - iga rida on parool (rida N vastab kasutajale N failis kasutajad)
+
+# Ülesanne 6 - root kasutaja õiguste kontrollimine.
+# See play käivitub alati esimesena; kui kontroll ei läbi, katkeb kogu töö.
+- name: Ülesanne 6 - root õiguste kontroll
+  hosts: webservers
+  gather_facts: true
+  tags: [always]
+  vars:
+    ansible_python_interpreter: auto_silent
+  tasks:
+    - name: Kontrolli, et playbook'i täidab root ja mitte sudo kaudu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['user_id'] == 'root'
+          - ansible_facts['env']['SUDO_USER'] is not defined
+        fail_msg: "Sul ei ole õigust antud playbook'i käivitamiseks"
+        success_msg: "Käivitaja on root, õigused on korras"
+
+# Ülesanne 1 - kasutaja loomine parameetri abil
+- name: Ülesanne 1 - kasutaja loomine käsurea parameetri abil
+  hosts: webservers
+  gather_facts: false
+  tags: [ul1]
+  vars:
+    ansible_python_interpreter: auto_silent
+  tasks:
+    - name: Kasutusjuhend, kui kasutajanime ei antud
+      ansible.builtin.debug:
+        msg: "Kasutusjuhend: ansible-playbook praks1.yml --tags ul1 -e kasutajanimi=NIMI"
+      when: kasutajanimi is not defined
+      run_once: true
+
+    - name: Loo kasutaja ilma paroolita, kodukataloog ja kest /bin/bash
+      ansible.builtin.user:
+        name: "{{ kasutajanimi }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+      register: ul1_tulemus
+      when: kasutajanimi is defined
+
+    - name: Võta /etc/passwd kirje
+      ansible.builtin.command: "getent passwd {{ kasutajanimi }}"
+      register: ul1_passwd
+      changed_when: false
+      when: kasutajanimi is defined
+
+    - name: Vaata kodukataloogi sisu
+      ansible.builtin.command: "ls -la /home/{{ kasutajanimi }}"
+      register: ul1_kodu
+      changed_when: false
+      when: kasutajanimi is defined
+
+    - name: Näita tulemust
+      ansible.builtin.debug:
+        msg:
+          - "Kasutaja nimega {{ kasutajanimi }} on lisatud süsteemi"
+          - "{{ ul1_passwd.stdout }}"
+          - "{{ ul1_kodu.stdout_lines }}"
+      when: kasutajanimi is defined
+
+# Ülesanne 2 - kasutajad failist
+- name: Ülesanne 2 - kasutajad failist
+  hosts: webservers
+  gather_facts: false
+  tags: [ul2]
+  vars:
+    ansible_python_interpreter: auto_silent
+    kasutajad_fail: "{{ playbook_dir }}/kasutajad"
+    ul2_kasutajad: "{{ lookup('ansible.builtin.file', kasutajad_fail).splitlines() | map('trim') | reject('equalto', '') | list }}"
+  tasks:
+    - name: Kontrolli, et kasutajate fail on olemas
+      ansible.builtin.stat:
+        path: "{{ kasutajad_fail }}"
+      delegate_to: localhost
+      run_once: true
+      register: ul2_fail
+
+    - name: Katkesta, kui faili ei ole
+      ansible.builtin.assert:
+        that: ul2_fail.stat.exists and ul2_fail.stat.readable
+        fail_msg: "Faili {{ kasutajad_fail }} ei leitud"
+        success_msg: "fail on korras"
+      run_once: true
+
+    - name: Loo kasutajad failist (kasutaja, kodukataloog, /bin/bash)
+      ansible.builtin.user:
+        name: "{{ item }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+      loop: "{{ ul2_kasutajad }}"
+
+    - name: Kontrolli /etc/passwd kirjeid ja kodukatalooge
+      ansible.builtin.shell: "getent passwd {{ item }}; ls -la /home/{{ item }}"
+      loop: "{{ ul2_kasutajad }}"
+      register: ul2_kontroll
+      changed_when: false
+
+    - name: Näita tulemust
+      ansible.builtin.debug:
+        msg: "Kasutaja nimega {{ item.item }} on lisatud süsteemi: {{ item.stdout_lines }}"
+      loop: "{{ ul2_kontroll.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+# Ülesanne 3 - kasutajad paroolidega failist (kasutajanimi:parool)
+- name: Ülesanne 3 - kasutajad paroolidega failist
+  hosts: webservers
+  gather_facts: false
+  tags: [ul3]
+  vars:
+    ansible_python_interpreter: auto_silent
+    kasutajad_paroolid_fail: "{{ playbook_dir }}/kasutajad-paroolid"
+    ul3_read: "{{ lookup('ansible.builtin.file', kasutajad_paroolid_fail).splitlines() | map('trim') | reject('equalto', '') | list }}"
+  tasks:
+    - name: Loo kasutajad ja pane paroolid (shadow faili läheb räsi, mitte avatud parool)
+      ansible.builtin.user:
+        name: "{{ item.split(':')[0] }}"
+        password: "{{ item.split(':', 1)[1] | password_hash('sha512', (item.split(':')[0] | hash('md5'))[:16]) }}"
+        update_password: always
+        shell: /bin/bash
+        create_home: true
+        state: present
+      loop: "{{ ul3_read }}"
+      loop_control:
+        label: "{{ item.split(':')[0] }}"
+
+    - name: Kontrolli /etc/passwd ja /etc/shadow kirjeid
+      ansible.builtin.shell: "getent passwd {{ item.split(':')[0] }}; getent shadow {{ item.split(':')[0] }}"
+      loop: "{{ ul3_read }}"
+      loop_control:
+        label: "{{ item.split(':')[0] }}"
+      register: ul3_kontroll
+      changed_when: false
+
+    - name: Näita tulemust
+      ansible.builtin.debug:
+        var: ul3_kontroll.results[0].stdout_lines
+      run_once: true
+
+# Ülesanne 4 - kasutajad ja paroolid on eraldatud (kaks faili, rida rea vastu)
+- name: Ülesanne 4 - kasutajad ja paroolid eraldi failides
+  hosts: webservers
+  gather_facts: false
+  tags: [ul4]
+  vars:
+    ansible_python_interpreter: auto_silent
+    kasutajad_fail: "{{ playbook_dir }}/kasutajad"
+    paroolid_fail: "{{ playbook_dir }}/paroolid"
+    ul4_kasutajad: "{{ lookup('ansible.builtin.file', kasutajad_fail).splitlines() | map('trim') | reject('equalto', '') | list }}"
+    ul4_paroolid: "{{ lookup('ansible.builtin.file', paroolid_fail).splitlines() | map('trim') | reject('equalto', '') | list }}"
+  tasks:
+    - name: Kontrolli, et ridu on mõlemas failis sama palju
+      ansible.builtin.assert:
+        that: ul4_kasutajad | length == ul4_paroolid | length
+        fail_msg: "Failides on erinev arv ridu"
+        success_msg: "failid on korras"
+      run_once: true
+
+    - name: Loo kasutajad ja pane vastavad paroolid (rida N kasutajate failis = rida N paroolide failis)
+      ansible.builtin.user:
+        name: "{{ item.0 }}"
+        password: "{{ item.1 | password_hash('sha512', (item.0 | hash('md5'))[:16]) }}"
+        update_password: always
+        shell: /bin/bash
+        create_home: true
+        state: present
+      loop: "{{ ul4_kasutajad | zip(ul4_paroolid) | list }}"
+      loop_control:
+        label: "{{ item.0 }}"
+
+    - name: Kontrolli /etc/shadow kirjeid
+      ansible.builtin.command: "getent shadow {{ item }}"
+      loop: "{{ ul4_kasutajad }}"
+      register: ul4_kontroll
+      changed_when: false
+
+    - name: Näita tulemust
+      ansible.builtin.debug:
+        msg: "{{ ul4_kontroll.results | map(attribute='stdout') | list }}"
+      run_once: true
+
+# Ülesanne 5 - paroolide genereerimine ja logimine
+- name: Ülesanne 5 - paroolide genereerimine ja logimine
+  hosts: webservers
+  gather_facts: false
+  tags: [ul5]
+  vars:
+    ansible_python_interpreter: auto_silent
+    kasutajad_fail: "{{ playbook_dir }}/kasutajad"
+    ul5_kasutajad: "{{ lookup('ansible.builtin.file', kasutajad_fail).splitlines() | map('trim') | reject('equalto', '') | list }}"
+    parooli_pikkus: 8
+    paroolihoidla: "{{ playbook_dir }}/paroolihoidla"
+    logifail: "{{ playbook_dir }}/loodud_kasutajad_paroolidega"
+  tasks:
+    - name: Genereeri igale kasutajale 8-sümbolline parool (pwgen -s 8 analoog), esmakordsel käivitusel
+      ansible.builtin.set_fact:
+        ul5_paroolid: "{{ ul5_paroolid | default({}) | combine({item: lookup('ansible.builtin.password', paroolihoidla ~ '/' ~ item ~ ' length=' ~ parooli_pikkus ~ ' chars=ascii_letters,digits')}) }}"
+      loop: "{{ ul5_kasutajad }}"
+      run_once: true
+      no_log: true
+
+    - name: Loo kasutajad genereeritud paroolidega
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password: "{{ ul5_paroolid[item] | password_hash('sha512', (item | hash('md5'))[:16]) }}"
+        update_password: always
+        shell: /bin/bash
+        create_home: true
+        state: present
+      loop: "{{ ul5_kasutajad }}"
+
+    - name: Logi loodud kasutajad ja paroolid logifaili (kasutaja - parool)
+      ansible.builtin.lineinfile:
+        path: "{{ logifail }}"
+        regexp: "^{{ item }} - "
+        line: "{{ item }} - {{ ul5_paroolid[item] }}"
+        create: true
+        mode: "0600"
+      delegate_to: localhost
+      run_once: true
+      loop: "{{ ul5_kasutajad }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Kontrolli /etc/passwd ja /etc/shadow kirjeid
+      ansible.builtin.shell: "getent passwd {{ item }}; getent shadow {{ item }}; ls -la /home/{{ item }}"
+      loop: "{{ ul5_kasutajad }}"
+      register: ul5_kontroll
+      changed_when: false
+
+    - name: Näita tulemust
+      ansible.builtin.debug:
+        msg: "Kasutaja nimega {{ item.item }} on lisatud süsteemi: {{ item.stdout_lines }}"
+      loop: "{{ ul5_kontroll.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+# Katsetamisel loodud kasutajate eemaldamine (käivitub ainult tagiga: --tags kustuta)
+- name: Katsekasutajate eemaldamine
+  hosts: webservers
+  gather_facts: false
+  tags: [never, kustuta]
+  vars:
+    ansible_python_interpreter: auto_silent
+  tasks:
+    - name: Kustuta kasutajad koos kodukataloogidega
+      ansible.builtin.user:
+        name: "{{ item }}"
+        state: absent
+        remove: true
+      loop: "{{ ['romet1', 'romet2', 'romet3'] + ([kasutajanimi] if kasutajanimi is defined else []) }}"

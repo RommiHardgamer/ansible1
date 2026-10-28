@@ -1,0 +1,59 @@
+---
+# Lab 4: MySQL serveri paigaldamine kliendiserverisse (klient1, Debian 13)
+# Fail:   /root/playbooks/mysql-server.yml
+# Autor:  Romet Mottus
+#
+# Kontroll:    ansible-playbook --check /root/playbooks/mysql-server.yml
+# Kaivitamine: ansible-playbook /root/playbooks/mysql-server.yml
+#
+# NB: --check rezhiimis ei laeta .deb faili tegelikult alla ega lisata repot,
+# seega 4. ja 6. ulesanne ei saa seal onnestuda. Need on markeeritud
+# "ignore_errors: {{ ansible_check_mode }}" - viga ignoreeritakse ainult --check ajal.
+
+- name: MySQL serveri paigaldamine
+  hosts: klient1
+  tasks:
+
+    # 1. Kataloog allalaaditud failide jaoks (omanik root, oigused 0755)
+    - name: Loome allalaaditud kataloog
+      file:
+        path: /root/allalaadimised
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # 2. MySQL ametliku APT repo konfiguratsioonipaketi allalaadimine wget abil
+    #    "creates" - kui fail on juba olemas, siis ei laeta uuesti (idempotentne)
+    - name: Laadime MySQL APT paketi wget abil
+      shell: wget -O /root/allalaadimised/mysql-apt-config_0.8.36-1_all.deb https://dev.mysql.com/get/mysql-apt-config_0.8.36-1_all.deb
+      args:
+        creates: /root/allalaadimised/mysql-apt-config_0.8.36-1_all.deb
+
+    # 3. gnupg on vajalik repositooriumi GPG votme kasitlemiseks
+    - name: Paigalda gnupg
+      apt:
+        name: gnupg
+        state: present
+
+    # 4. MySQL repositooriumi paigaldamine allalaaditud .deb failist (vaikevalikud)
+    - name: Installeerime mysql repositoorium
+      apt:
+        deb: /root/allalaadimised/mysql-apt-config_0.8.36-1_all.deb
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    # 5. Peale repositooriumi lisamist tuleb pakettide nimekiri uuendada (apt update)
+    - name: Teeme apt-le update
+      apt:
+        update_cache: true
+
+    # 6. MySQL serveri paigaldamine
+    - name: Paigaldame mysql-server
+      apt:
+        name: mysql-server
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      ignore_errors: "{{ ansible_check_mode }}"

@@ -1,0 +1,461 @@
+---
+# BASH haldus - praks2 (andmete varundamine ehk backup), lahendus Ansible'iga
+#
+# Käivitamine:  ansible-playbook praks2.yml                (kõik sammud)
+#               ansible-playbook praks2.yml --tags naide   (näide: kodukataloogid -> /home_bcp)
+#               ansible-playbook praks2.yml --tags s1,s2   (üksikud sammud: s1 .. s11)
+# Sammu 12 (backupexec) lahendus on eraldi failis backupexec.yml
+#
+# Sihtmasinates kasutatakse kaustu /root/praks2/{src,backup,logs} (vt muutujat praks2).
+
+# NÄIDE - iga kasutaja kodukataloog arhiveeritakse, pakitakse ja pannakse kausta home_bcp
+- name: Näide - kasutajate kodukataloogide varundamine (kasutaja.PP.KK.AAAA.tar.gz)
+  hosts: webservers
+  gather_facts: false
+  tags: [naide]
+  vars:
+    ansible_python_interpreter: auto_silent
+    varukaust: /home_bcp
+    kuupaev: "{{ '%d.%m.%Y' | strftime }}"
+  tasks:
+    - name: Paigalda tar ja gzip
+      ansible.builtin.package:
+        name: [tar, gzip]
+        state: present
+      when: paketid_paigalda | default(true) | bool
+
+    - name: Loo varukoopiate kaust home_bcp
+      ansible.builtin.file:
+        path: "{{ varukaust }}"
+        state: directory
+        mode: "0700"
+
+    - name: Leia kodukataloogid (failid jäetakse vahele, varundatakse ainult kaustad)
+      ansible.builtin.find:
+        paths: /home
+        file_type: directory
+        recurse: false
+      register: kodukataloogid
+
+    - name: Arhiveeri ja paki iga kodukataloog kuupäevaga ning pane kausta home_bcp
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -czf
+          - "{{ varukaust }}/{{ item.path | basename }}.{{ kuupaev }}.tar.gz"
+          - -C
+          - /home
+          - "{{ item.path | basename }}"
+      loop: "{{ kodukataloogid.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      changed_when: true
+
+    - name: Vaata varukoopiaid
+      ansible.builtin.command: "ls -l {{ varukaust }}"
+      register: nae_koopiaid
+      changed_when: false
+
+    - name: Näita tulemust
+      ansible.builtin.debug:
+        var: nae_koopiaid.stdout_lines
+
+# VARUKOOPIA KUUPÄEVAGA JA KONTROLLIGA - 12 sammu
+- name: Varukoopia kuupäevaga ja kontrolliga
+  hosts: webservers
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: auto_silent
+    praks2: /root/praks2
+    src_kaust: "{{ praks2 }}/src"
+    backup_kaust: "{{ praks2 }}/backup"
+    logifail: "{{ praks2 }}/logs/backup.log"
+    hoia: 3
+    zstd_valik: zstd -19 -T0
+    pakid: "{{ ['tar', 'zstd', 'xz-utils', 'gzip'] if ansible_facts['os_family'] == 'Debian' else ['tar', 'zstd', 'xz', 'gzip'] }}"
+  tasks:
+    # ---- ettevalmistus: paketid, kaustad ja katseandmed (käib alati kaasa) ----
+    - name: Ettevalmistus - paigalda tar, zstd, xz ja gzip
+      ansible.builtin.package:
+        name: "{{ pakid }}"
+        state: present
+      when: paketid_paigalda | default(true) | bool
+      tags: [always]
+
+    - name: Ettevalmistus - loo kaustad src, backup ja logs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ src_kaust }}/docs"
+        - "{{ src_kaust }}/imgs"
+        - "{{ src_kaust }}/bin"
+        - "{{ backup_kaust }}"
+        - "{{ praks2 }}/logs"
+      tags: [always]
+
+    - name: Ettevalmistus - loo katsefailid (olemasolevaid ei kirjutata üle)
+      ansible.builtin.copy:
+        dest: "{{ src_kaust }}/{{ item.nimi }}"
+        content: "{{ item.sisu }}"
+        mode: "{{ item.mode | default('0644') }}"
+        force: false
+      loop:
+        - {nimi: docs/a.txt, sisu: "dokument a\n"}
+        - {nimi: docs/b.txt, sisu: "dokument b\n"}
+        - {nimi: bin/run.sh, sisu: "#!/bin/bash\necho tere\n", mode: "0755"}
+      tags: [always]
+
+    - name: Ettevalmistus - loo pildifailid (100 KB juhuandmeid)
+      ansible.builtin.command:
+        cmd: "dd if=/dev/urandom of={{ src_kaust }}/imgs/{{ item }} bs=1024 count=100"
+        creates: "{{ src_kaust }}/imgs/{{ item }}"
+      loop: [a.jpg, b.jpg]
+      tags: [always]
+
+    # ---- 1) Lihtne varukoopia .tar.zst ----
+    - name: 1) Lihtne varukoopia - tar -I 'zstd -19 -T0' -cf ... -C praks2 src
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -I
+          - "{{ zstd_valik }}"
+          - -cf
+          - "{{ backup_kaust }}/src_{{ '%Y%m%d-%H%M%S' | strftime }}.tar.zst"
+          - -C
+          - "{{ praks2 }}"
+          - src
+      changed_when: true
+      tags: [s1]
+
+    - name: 1) Kontroll - kaustas backup on uus .tar.zst fail
+      ansible.builtin.shell: "ls -l {{ backup_kaust }}/*.tar.zst"
+      register: s1_ls
+      changed_when: false
+      tags: [s1]
+
+    - name: 1) Näita tulemust
+      ansible.builtin.debug:
+        var: s1_ls.stdout_lines
+      tags: [s1]
+
+    # ---- 2) Arhiivi kontrollimine ----
+    - name: 2) Leia uusim varukoopia
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "src_*.tar.zst"
+      register: leitud
+      tags: [s2, s3]
+
+    - name: 2) Uusim arhiiv on
+      ansible.builtin.set_fact:
+        uusim: "{{ (leitud.files | sort(attribute='mtime') | last).path }}"
+      tags: [s2, s3]
+
+    - name: 2) Arhiivi sisu - tar -I 'zstd -d' -tf (esimesed 5 rida)
+      ansible.builtin.command:
+        argv: [tar, -I, "zstd -d", -tf, "{{ uusim }}"]
+      register: s2_sisu
+      changed_when: false
+      tags: [s2]
+
+    - name: 2) Näita esimesi 5 rida ja kontrolli, et alamkaustad on sees
+      ansible.builtin.assert:
+        that:
+          - "'src/docs/' in s2_sisu.stdout_lines"
+          - "'src/imgs/' in s2_sisu.stdout_lines"
+        success_msg: "{{ s2_sisu.stdout_lines[:5] }}"
+      tags: [s2]
+
+    # ---- 3) Varukoopia suurus ----
+    - name: 3) Arhiivi suurus - du -h
+      ansible.builtin.command: "du -h {{ uusim }}"
+      register: s3_du
+      changed_when: false
+      tags: [s3]
+
+    - name: 3) Näita suurust
+      ansible.builtin.debug:
+        msg: "Arhiivi {{ uusim | basename }} suurus on {{ s3_du.stdout.split()[0] }}"
+      tags: [s3]
+
+    # ---- 4) Ainult viimased koopiad ----
+    - name: 4) Tee 5 järjestikust varukoopiat (1 sekundi vahega)
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -I
+          - "{{ zstd_valik }}"
+          - -cf
+          - "{{ backup_kaust }}/src_{{ '%Y%m%d-%H%M%S' | strftime }}.tar.zst"
+          - -C
+          - "{{ praks2 }}"
+          - src
+      loop: [1, 2, 3, 4, 5]
+      loop_control:
+        pause: 1
+      changed_when: true
+      tags: [s4]
+
+    - name: 4) Leia kõik src_*.tar.zst koopiad
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "src_*.tar.zst"
+      register: s4_koik
+      tags: [s4]
+
+    - name: 4) Kustuta vanemad koopiad (ls -1t | tail -n +4 | xargs rm), alles jäävad {{ hoia }} uusimat
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ (s4_koik.files | sort(attribute='mtime', reverse=true))[hoia:] | map(attribute='path') | product(['', '.sha256']) | map('join') | list }}"
+      tags: [s4]
+
+    - name: 4) Kontroll - alles on ainult {{ hoia }} faili
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "src_*.tar.zst"
+      register: s4_parast
+      failed_when: s4_parast.matched != hoia
+      tags: [s4]
+
+    # ---- 5) Failide välistamine ----
+    - name: 5) Varukoopia ilma piltideta ja bin kaustata (--exclude)
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -I
+          - "{{ zstd_valik }}"
+          - --exclude=*.jpg
+          - --exclude=bin
+          - -cf
+          - "{{ backup_kaust }}/valistus_{{ '%Y%m%d-%H%M%S' | strftime }}.tar.zst"
+          - -C
+          - "{{ praks2 }}"
+          - src
+      changed_when: true
+      tags: [s5]
+
+    - name: 5) Vaata uusimat välistusega arhiivi sisu
+      ansible.builtin.shell: "tar -I 'zstd -d' -tf $(ls -1t {{ backup_kaust }}/valistus_*.tar.zst | head -n 1)"
+      register: s5_sisu
+      changed_when: false
+      tags: [s5]
+
+    - name: 5) Kontroll - arhiiv ei sisalda jpg-faile ega run.sh
+      ansible.builtin.assert:
+        that:
+          - s5_sisu.stdout_lines | select('search', '[.]jpg$') | list | length == 0
+          - s5_sisu.stdout_lines | select('search', 'run[.]sh$') | list | length == 0
+        success_msg: "{{ s5_sisu.stdout_lines }}"
+      tags: [s5]
+
+    # ---- 6) Kuiv jooks ----
+    - name: 6) Mitu arhiivi on enne kuiva jooksu
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "*.tar.*"
+      register: s6_enne
+      tags: [s6]
+
+    - name: 6) Kuiv jooks - tar -cf - ... | tar -tvf - (näitab faile, uut arhiivi ei tehta)
+      ansible.builtin.shell: "set -o pipefail; tar -cf - -C {{ praks2 }} src | tar -tvf -"
+      args:
+        executable: /bin/bash
+      register: s6_kuiv
+      changed_when: false
+      tags: [s6]
+
+    - name: 6) Mitu arhiivi on pärast kuiva jooksu
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "*.tar.*"
+      register: s6_parast
+      tags: [s6]
+
+    - name: 6) Kontroll - failide loend on ekraanil, aga backup kaust ei muutunud
+      ansible.builtin.assert:
+        that: s6_enne.matched == s6_parast.matched
+        success_msg: "{{ s6_kuiv.stdout_lines }}"
+      tags: [s6]
+
+    # ---- 7) Logimine ----
+    - name: 7) Logi - BACKUP START
+      ansible.builtin.lineinfile:
+        path: "{{ logifail }}"
+        line: "[ {{ '%F %T' | strftime }} ] BACKUP START"
+        create: true
+        insertafter: EOF
+      tags: [s7]
+
+    - name: 7) Tee varukoopia
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -I
+          - "{{ zstd_valik }}"
+          - -cf
+          - "{{ backup_kaust }}/src_{{ '%Y%m%d-%H%M%S' | strftime }}.tar.zst"
+          - -C
+          - "{{ praks2 }}"
+          - src
+      changed_when: true
+      tags: [s7]
+
+    - name: 7) Logi - BACKUP END
+      ansible.builtin.lineinfile:
+        path: "{{ logifail }}"
+        line: "[ {{ '%F %T' | strftime }} ] BACKUP END"
+        insertafter: EOF
+      tags: [s7]
+
+    - name: 7) Vaata logifaili (cat backup.log)
+      ansible.builtin.command: "cat {{ logifail }}"
+      register: s7_log
+      changed_when: false
+      tags: [s7]
+
+    - name: 7) Näita logi
+      ansible.builtin.debug:
+        var: s7_log.stdout_lines
+      tags: [s7]
+
+    # ---- 8) Vaba ruumi kontroll ----
+    - name: 8) Lähtekausta suurus baitides - du -sb
+      ansible.builtin.command: "du -sb {{ src_kaust }}"
+      register: s8_du
+      changed_when: false
+      tags: [s8]
+
+    - name: 8) Vaba ruum varukaustas baitides - df -B1
+      ansible.builtin.command: "df -B1 --output=avail {{ backup_kaust }}"
+      register: s8_df
+      changed_when: false
+      tags: [s8]
+
+    - name: 8) Kontroll - kui ruumi on liiga vähe, varundus ei käivitu
+      ansible.builtin.assert:
+        that: s8_df.stdout_lines[1] | int > s8_du.stdout.split()[0] | int
+        fail_msg: "Ruumi on liiga vähe, varundus ei käivitu"
+        success_msg: "Ruumi on piisavalt: vaba {{ s8_df.stdout_lines[1] | int }} B, vaja {{ s8_du.stdout.split()[0] | int }} B"
+      tags: [s8]
+
+    # ---- 9) SHA-256 kontrollsumma ----
+    - name: 9) Leia uusim varukoopia (eelmised sammud on võinud vanu kustutada)
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "src_*.tar.zst"
+      register: s9_leitud
+      tags: [s9]
+
+    - name: 9) Uusim arhiiv on
+      ansible.builtin.set_fact:
+        uusim: "{{ (s9_leitud.files | sort(attribute='mtime') | last).path }}"
+      tags: [s9]
+
+    - name: 9) Arvuta kontrollsumma - sha256sum fail
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ uusim | basename }}"]
+        chdir: "{{ backup_kaust }}"
+      register: s9_summa
+      changed_when: false
+      tags: [s9]
+
+    - name: 9) Salvesta kontrollsumma faili (> fail.sha256)
+      ansible.builtin.copy:
+        content: "{{ s9_summa.stdout }}\n"
+        dest: "{{ uusim }}.sha256"
+        mode: "0644"
+      tags: [s9]
+
+    - name: 9) Kontrolli arhiivi - sha256sum -c
+      ansible.builtin.command:
+        argv: [sha256sum, -c, "{{ uusim | basename }}.sha256"]
+        chdir: "{{ backup_kaust }}"
+      register: s9_kontroll
+      changed_when: false
+      tags: [s9]
+
+    - name: 9) Tulemus (oodatud - fail.tar.zst - OK)
+      ansible.builtin.assert:
+        that: "s9_kontroll.stdout is search(': OK')"
+        success_msg: "{{ s9_kontroll.stdout }}"
+      tags: [s9]
+
+    # ---- 10) Erinevate kompressorite valik ----
+    - name: 10) Ühine ajatempel kolmele arhiivile
+      ansible.builtin.set_fact:
+        s10_ts: "{{ '%Y%m%d-%H%M%S' | strftime }}"
+      tags: [s10]
+
+    - name: 10) Tee kolm arhiivi - zstd (-I), gzip (-z) ja xz (-J)
+      ansible.builtin.command:
+        argv: "{{ item.opts + ['-cf', backup_kaust ~ '/kompr_' ~ s10_ts ~ '.' ~ item.laiend, '-C', praks2, 'src'] }}"
+      loop:
+        - {laiend: tar.zst, opts: [tar, -I, "zstd -19 -T0"]}
+        - {laiend: tar.gz, opts: [tar, -z]}
+        - {laiend: tar.xz, opts: [tar, -J]}
+      loop_control:
+        label: "{{ item.laiend }}"
+      changed_when: true
+      tags: [s10]
+
+    - name: 10) Vaata faile - ls -l
+      ansible.builtin.shell: "ls -l {{ backup_kaust }}/kompr_{{ s10_ts }}.*"
+      register: s10_ls
+      changed_when: false
+      tags: [s10]
+
+    - name: 10) Näita tulemust
+      ansible.builtin.debug:
+        var: s10_ls.stdout_lines
+      tags: [s10]
+
+    # ---- 11) .backupignore kasutamine ----
+    - name: 11) Loo src/.backupignore välistusreeglitega
+      ansible.builtin.copy:
+        dest: "{{ src_kaust }}/.backupignore"
+        content: "imgs/\n*.tmp\n"
+        mode: "0644"
+      tags: [s11]
+
+    - name: 11) Loe .backupignore
+      ansible.builtin.slurp:
+        src: "{{ src_kaust }}/.backupignore"
+      register: s11_ignore
+      tags: [s11]
+
+    - name: 11) Koosta tar-i välistuste fail (tar ei taha kaldkriipsu lõppu)
+      ansible.builtin.copy:
+        dest: "{{ praks2 }}/backupignore.tar"
+        content: "{{ (s11_ignore.content | b64decode).splitlines() | map('regex_replace', '/$', '') | join('\n') }}\n"
+        mode: "0644"
+      tags: [s11]
+
+    - name: 11) Varukoopia, mis kasutab --exclude-from
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -I
+          - "{{ zstd_valik }}"
+          - "--exclude-from={{ praks2 }}/backupignore.tar"
+          - -cf
+          - "{{ backup_kaust }}/ignore_{{ '%Y%m%d-%H%M%S' | strftime }}.tar.zst"
+          - -C
+          - "{{ praks2 }}"
+          - src
+      changed_when: true
+      tags: [s11]
+
+    - name: 11) Vaata uusima arhiivi sisu
+      ansible.builtin.shell: "tar -I 'zstd -d' -tf $(ls -1t {{ backup_kaust }}/ignore_*.tar.zst | head -n 1)"
+      register: s11_sisu
+      changed_when: false
+      tags: [s11]
+
+    - name: 11) Kontroll - arhiivis ei ole pilte (imgs/)
+      ansible.builtin.assert:
+        that: s11_sisu.stdout_lines | select('search', 'imgs') | list | length == 0
+        success_msg: "{{ s11_sisu.stdout_lines }}"
+      tags: [s11]

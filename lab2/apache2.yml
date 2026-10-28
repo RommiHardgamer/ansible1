@@ -1,0 +1,37 @@
+# lab 2: apache2 ja userdir klient1 serveris
+# klient1 ip 192.168.45.240
+---
+- name: apache2 paigaldamine ja kasutaja koduleht
+  hosts: klient1
+  tasks:
+    # 1. paigaldame apache2
+    - name: install apache2
+      apt: name=apache2 state=present update_cache=yes
+    # 2. lubame userdir mooduli
+    - name: lubame userdir mod
+      apache2_module: name=userdir state=present
+    # 2b. anname apache kasutajale ligipaas koduketale
+    - name: kodukausta ligipaas
+      file: path=/home/romet mode=0711
+    # 3. loome public_html kausta
+    - name: loome public_html kausta
+      file: path=/home/romet/public_html state=directory owner=romet group=romet mode=0755
+    # 4. kopeerime vaikelehe user public_html kataloogi
+    - name: kopeerime index.html fail user public_html kataloogi
+      copy:
+        src: /usr/share/apache2/default-site/index.html
+        dest: /home/romet/public_html/index.html
+        remote_src: yes
+        owner: romet
+        group: romet
+        mode: 0644
+        force: no
+    # 4b. muudame lause user lehel
+    - name: user index.html redigeerimine
+      lineinfile:
+        path: /home/romet/public_html/index.html
+        regexp: '^ +.pache2 .ebian .efault .age$'
+        line: '          romet lehekylg'
+    # 5. taaskaivitame apache2
+    - name: apache2 serverile alglaadimine, restart
+      service: name=apache2 state=restarted enabled=yes

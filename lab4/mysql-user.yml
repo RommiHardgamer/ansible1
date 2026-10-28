@@ -1,0 +1,38 @@
+---
+# Lab 4 iseseisev ulesanne: MySQL root parool (qwerty) ja /root/.my.cnf
+# Kaivitamine: ansible-playbook /root/playbooks/mysql-user.yml
+- name: MySQL root kasutaja seadistamine
+  hosts: klient1
+  vars:
+    mysql_root_password: qwerty
+  tasks:
+
+    # 1. mysql_user moodul vajab kliendiserveris PyMySQL teeki
+    - name: Paigaldame python3-pymysql
+      apt:
+        name: python3-pymysql
+        state: present
+
+    # 2. root kasutajale parool (auth_socket asemel caching_sha2_password)
+    - name: Seame MySQL root kasutajale parooli
+      community.mysql.mysql_user:
+        name: root
+        host: localhost
+        plugin: caching_sha2_password
+        plugin_auth_string: "{{ mysql_root_password }}"
+        priv: "*.*:ALL,GRANT"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        column_case_sensitive: true
+        state: present
+
+    # 3. ligipaasuandmed faili /root/.my.cnf (parooli ei pea iga kord sisestama)
+    - name: Salvestame andmed faili /root/.my.cnf
+      copy:
+        dest: /root/.my.cnf
+        content: |
+          [client]
+          user=root
+          password={{ mysql_root_password }}
+        owner: root
+        group: root
+        mode: "0600"

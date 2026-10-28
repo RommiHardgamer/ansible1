@@ -1,0 +1,140 @@
+---
+# SHA-256 kontrollsumma (Linux skriptimine) - mini-praktika ja spikker projekti jaoks, Ansible'iga
+#
+# Käivitamine:  ansible-playbook sha256.yml                 (kõik)
+#               ansible-playbook sha256.yml --tags mini     (mini-praktika: demo.txt)
+#               ansible-playbook sha256.yml --tags spikker  (projekti arhiivid kaustas /root/praks2/backup)
+#
+# Spikri osa eeldab, et kaustas backup on vähemalt üks src_*.tar.zst arhiiv
+# (neid teeb:  ansible-playbook praks2.yml --tags s1  või  praks2.yml tervikuna).
+
+# MINI-PRAKTIKA (tee ise)
+- name: Mini-praktika - väike fail, kontrollsumma, riku ja kontrolli uuesti
+  hosts: webservers
+  gather_facts: false
+  tags: [mini]
+  vars:
+    ansible_python_interpreter: auto_silent
+    demo_kaust: /root/praks2/sha256demo
+  tasks:
+    - name: Loo kaust mini-praktika jaoks
+      ansible.builtin.file:
+        path: "{{ demo_kaust }}"
+        state: directory
+        mode: "0755"
+
+    - name: 1) echo "hello" > demo.txt
+      ansible.builtin.copy:
+        content: "hello\n"
+        dest: "{{ demo_kaust }}/demo.txt"
+        mode: "0644"
+        force: true
+
+    - name: 1) sha256sum demo.txt > demo.txt.sha256
+      ansible.builtin.shell: "set -o pipefail; sha256sum demo.txt > demo.txt.sha256"
+      args:
+        chdir: "{{ demo_kaust }}"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: 2) sha256sum -c demo.txt.sha256
+      ansible.builtin.command: sha256sum -c demo.txt.sha256
+      args:
+        chdir: "{{ demo_kaust }}"
+      register: mini_ok
+      changed_when: false
+
+    - name: 2) Peaks tulema - demo.txt - OK
+      ansible.builtin.assert:
+        that: "mini_ok.stdout is search('demo.txt: OK')"
+        success_msg: "{{ mini_ok.stdout }}"
+
+    - name: 3) "Riku" fail - echo "x" >> demo.txt
+      ansible.builtin.shell: 'echo "x" >> demo.txt'
+      args:
+        chdir: "{{ demo_kaust }}"
+      changed_when: true
+
+    - name: 3) sha256sum -c demo.txt.sha256 (nüüd peab tulema FAILED)
+      ansible.builtin.command: sha256sum -c demo.txt.sha256
+      args:
+        chdir: "{{ demo_kaust }}"
+      register: mini_riku
+      changed_when: false
+      failed_when: false
+
+    - name: 3) Kontrolli, et muudetud fail tõesti ei klapi
+      ansible.builtin.assert:
+        that:
+          - mini_riku.rc != 0
+          - "mini_riku.stdout is search('demo.txt: FAILED')"
+        success_msg: "{{ mini_riku.stdout }} (nagu oodatud: {{ mini_riku.stderr }})"
+
+# SPIKKER MEIE PROJEKTI JAOKS (arhiivid kaustas /root/praks2/backup)
+- name: Spikker - arhiivide kontrollsummad kaustas backup
+  hosts: webservers
+  gather_facts: false
+  tags: [spikker]
+  vars:
+    ansible_python_interpreter: auto_silent
+    backup_kaust: /root/praks2/backup
+  tasks:
+    - name: Leia projekti arhiivid
+      ansible.builtin.find:
+        paths: "{{ backup_kaust }}"
+        patterns: "src_*.tar.zst"
+      register: sp_arhiivid
+
+    - name: Katkesta selgitusega, kui arhiive pole
+      ansible.builtin.assert:
+        that: sp_arhiivid.matched > 0
+        fail_msg: "Kaustas {{ backup_kaust }} pole src_*.tar.zst arhiive, käivita enne: ansible-playbook praks2.yml --tags s1"
+
+    - name: Uusim arhiiv (ARCHIVE="$(ls -1t src_*.tar.zst | head -n1)")
+      ansible.builtin.set_fact:
+        sp_archive: "{{ (sp_arhiivid.files | sort(attribute='mtime') | last).path }}"
+
+    - name: Pärast arhiivi loomist - sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+      ansible.builtin.shell: 'set -o pipefail; sha256sum "{{ sp_archive | basename }}" > "{{ sp_archive | basename }}.sha256"'
+      args:
+        chdir: "{{ backup_kaust }}"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Kontroll hiljem - cd backup; sha256sum -c "$(basename "$ARCHIVE").sha256"
+      ansible.builtin.command: 'sha256sum -c "{{ sp_archive | basename }}.sha256"'
+      args:
+        chdir: "{{ backup_kaust }}"
+      register: sp_uks
+
+    - name: Kuvab - src_YYYYMMDD-HHMMSS.tar.zst - OK
+      ansible.builtin.assert:
+        that: "sp_uks.stdout is search(': OK')"
+        success_msg: "{{ sp_uks.stdout }}"
+
+    # Kõigi arhiivide kaupa (-print0 ja -0 tulevad toime ka tühikutega failinimedega).
+    # Käsk on täpselt nagu õpetuses.
+    - name: Kõigi arhiivide kaupa - find ... -print0 | xargs -0 sha256sum > checksums.txt
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        find . -maxdepth 1 -type f -name 'src_*.tar.*' -print0
+        | xargs -0 sha256sum > checksums.txt
+      args:
+        chdir: "{{ backup_kaust }}"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Kõigi arhiivide kaupa - sha256sum -c checksums.txt
+      ansible.builtin.command: sha256sum -c checksums.txt
+      args:
+        chdir: "{{ backup_kaust }}"
+      register: sp_koik
+      changed_when: false
+
+    - name: Kõik arhiivid peavad olema OK
+      ansible.builtin.assert:
+        that:
+          - sp_koik.rc == 0
+          - sp_koik.stdout_lines | length >= sp_arhiivid.matched
+          - "sp_koik.stdout_lines | select('search', ': OK$') | list | length == sp_koik.stdout_lines | length"
+        success_msg: "{{ sp_koik.stdout_lines }}"
